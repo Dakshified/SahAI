@@ -20,6 +20,8 @@ import Profile from './pages/Profile';
 import Login from './pages/Login';
 import Signup from './pages/Signup';
 import Terms from './pages/Terms';
+import PublicProfile from './pages/PublicProfile';
+import InstitutionDashboard from './pages/InstitutionDashboard';
 
 function App() {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
@@ -96,6 +98,9 @@ function App() {
             path="/gamification" 
             element={isAuthenticated ? <Gamification /> : <Navigate to="/login" replace />} 
           />
+          {/* Publicly Shareable / Recruiters Routing */}
+          <Route path="/profile/share/:userId" element={<PublicProfile />} />
+          <Route path="/institution" element={<InstitutionDashboard />} />
         </Routes>
       </div>
     </div>

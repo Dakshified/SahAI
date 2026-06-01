@@ -49,12 +49,21 @@ def analyze_vocal_enhanced(audio_path, text=""):  # Pass text for WPM
         duration = len(y) / sr
         if duration < 10: return {'fluency': 0.4, 'pauses': 0, 'vocal': "Short—stretch to 30-90s!", 'wpm': 0, 'energy_variation': 0.0, 'tempo_fluctuation': 0.0, 'jitter': 0.0, 'emotion': 'hesitant'}
         
-        # Pitch + New Jitter (nervousness: pitch std)
+        # Z-score normalization for gender-neutral pitch tracking (Responsible AI Bias Shield)
+        # Standardizes pitch variation to ensure male/female speakers are evaluated on voice stability without pitch-frequency bias
         pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
         voiced = magnitudes > np.median(magnitudes)
         pitch_vals = pitches[voiced]
-        pitch_mean = np.mean(pitch_vals) if len(pitch_vals) > 0 else 180
-        jitter = np.std(pitch_vals) / pitch_mean if len(pitch_vals) > 0 else 0.0  # High = nervous
+        pitch_mean = np.mean(pitch_vals) if len(pitch_vals) > 0 else 180.0
+        pitch_std = np.std(pitch_vals) if len(pitch_vals) > 0 else 0.0
+        
+        if len(pitch_vals) > 1 and pitch_std > 0:
+            z_scores = (pitch_vals - pitch_mean) / pitch_std
+            # Calculate jitter as the mean absolute successive differences of standardized z-scores
+            jitter = float(np.mean(np.abs(np.diff(z_scores)))) / 20.0
+        else:
+            jitter = 0.0
+
         
         # Energy Var
         rms = librosa.feature.rms(y=y)[0]

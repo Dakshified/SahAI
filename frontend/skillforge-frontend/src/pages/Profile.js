@@ -2,7 +2,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
-import { FaUser, FaChartLine, FaEdit, FaChevronLeft, FaChevronRight } from 'react-icons/fa';
+import { FaUser, FaChartLine, FaEdit, FaChevronLeft, FaChevronRight, FaShareAlt } from 'react-icons/fa';
 import { Bar, Doughnut } from 'react-chartjs-2';
 import {
   Chart as ChartJS,
@@ -24,6 +24,12 @@ const Profile = () => {
   const [activeTab, setActiveTab] = useState('overview');
   const userId = sessionStorage.getItem('user');
   const username = sessionStorage.getItem('username') || (userId ? userId.split('@')[0] : 'User');
+
+  const handleShareProfile = () => {
+    const shareUrl = `${window.location.origin}/profile/share/${encodeURIComponent(userId)}`;
+    navigator.clipboard.writeText(shareUrl);
+    alert(`Public Verification Profile Link Copied!\n${shareUrl}`);
+  };
 
   const [userData, setUserData] = useState({
     name: username,
@@ -287,9 +293,26 @@ const Profile = () => {
           <motion.div style={cardStyle} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
               <h3 style={{ margin: 0, color: '#fff' }}>Personal Information</h3>
-              <button onClick={handleEditToggle} style={{ background: 'none', border: 'none', color: '#10b981', cursor: 'pointer' }}>
-                <FaEdit size={22} />
-              </button>
+              <div style={{ display: 'flex', gap: '1.2rem', alignItems: 'center' }}>
+                <button 
+                  onClick={handleShareProfile} 
+                  title="Copy shareable Verified Capability Profile link"
+                  style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', display: 'flex', alignItems: 'center', transition: 'transform 0.2s' }}
+                  onMouseEnter={(e) => e.currentTarget.style.transform = 'scale(1.15)'}
+                  onMouseLeave={(e) => e.currentTarget.style.transform = 'scale(1)'}
+                >
+                  <FaShareAlt size={20} />
+                </button>
+                <button 
+                  onClick={handleEditToggle} 
+                  title="Edit profile info"
+                  style={{ background: 'none', border: 'none', color: '#10b981', cursor: 'pointer', display: 'flex', alignItems: 'center', transition: 'transform 0.2s' }}
+                  onMouseEnter={(e) => e.currentTarget.style.transform = 'scale(1.15)'}
+                  onMouseLeave={(e) => e.currentTarget.style.transform = 'scale(1)'}
+                >
+                  <FaEdit size={22} />
+                </button>
+              </div>
             </div>
 
             {userData.editing ? (

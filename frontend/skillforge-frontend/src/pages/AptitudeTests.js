@@ -286,6 +286,11 @@ const AptitudeTests = () => {
     };
 
 
+    const cleanQuestionText = (text) => {
+        if (typeof text !== 'string') return '';
+        return text.replace(/^\s*Q\d+[:.-]?\s*/i, '');
+    };
+
     // ---------------------------------------
     // UI SECTION (FULL FINAL WORKING)
     // ---------------------------------------
@@ -354,7 +359,7 @@ const AptitudeTests = () => {
                             </div>
 
                             <motion.div key={current} className="question-box">
-                                <h3>Q{current + 1}. {q.question}</h3>
+                                 <h3>Q{current + 1}. {cleanQuestionText(q.question)}</h3>
 
                                 {!showFeedback ? (
                                     <div className="options-grid">

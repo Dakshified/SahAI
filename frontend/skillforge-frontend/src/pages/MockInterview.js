@@ -89,6 +89,36 @@ const css = `
 .question-head { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 20px; }
 .q-title { margin: 0; font-size: 20px; font-weight: 700; color: #e6eef8; } /* Bolder */
 .q-prompt { color: var(--muted); margin-top: 4px; font-size: 16px; line-height: 1.5; font-style: italic; } /* More readable */
+.q-container-clickable {
+  cursor: pointer;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: rgba(6, 182, 212, 0.02);
+  border: 1px solid transparent;
+  transition: all 0.2s ease-in-out;
+  flex: 1;
+}
+.q-container-clickable:hover {
+  background: rgba(6, 182, 212, 0.08);
+  border-color: rgba(6, 182, 212, 0.2);
+  transform: translateY(-1px);
+}
+.q-container-clickable:active {
+  transform: translateY(1px);
+}
+@keyframes speaker-pulse {
+  0% { transform: scale(1); opacity: 0.8; }
+  50% { transform: scale(1.15); opacity: 1; }
+  100% { transform: scale(1); opacity: 0.8; }
+}
+.speaker-icon {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 16px;
+  color: var(--accent);
+  vertical-align: middle;
+  animation: speaker-pulse 2s infinite ease-in-out;
+}
 
 /* video card - larger, more visible */
 .video-card { 
@@ -279,6 +309,7 @@ export default function MockInterview() {
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [timeLeft, setTimeLeft] = useState(90);
   const [started, setStarted] = useState(false);
+  const [bilingual, setBilingual] = useState(false);
 
   // refs
   const streamRef = useRef(null);
@@ -292,6 +323,19 @@ export default function MockInterview() {
   const animationRef = useRef(null);
   const timerIntervalRef = useRef(null);
   const interviewSectionRef = useRef(null);
+
+  // Pre-load synthesis voices for responsive TTS
+  useEffect(() => {
+    if (typeof window !== 'undefined' && window.speechSynthesis) {
+      window.speechSynthesis.getVoices();
+      if (window.speechSynthesis.onvoiceschanged !== undefined) {
+        window.speechSynthesis.onvoiceschanged = () => {
+          window.speechSynthesis.getVoices();
+        };
+      }
+    }
+  }, []);
+
 
   // make questionBank stable to satisfy hooks/exhaustive-deps
   const questionBank = useMemo(() => [
@@ -516,6 +560,7 @@ export default function MockInterview() {
         fd.append('question', qIndex >= 0 ? questionBank[qIndex]?.text : '');
         fd.append('question_type', qIndex >= 0 ? questionBank[qIndex]?.type : '');
         fd.append('confidence', (confidence || 0).toString());
+        fd.append('bilingual', bilingual ? 'true' : 'false');
 
         const res = await fetch('http://localhost:5000/api/analyze', { method:'POST', body: fd });
         if (!res.ok) throw new Error('analysis failed');
@@ -581,14 +626,25 @@ export default function MockInterview() {
     if (!window.speechSynthesis) return;
     try {
       window.speechSynthesis.cancel();
-      const utt = new SpeechSynthesisUtterance(text);
-      utt.lang = 'en-IN';
-      utt.rate = 0.95; utt.pitch = 1.0;
-      // choose en-IN if available
-      const voices = window.speechSynthesis.getVoices();
-      const pick = voices.find(v => v.lang && v.lang.toLowerCase().startsWith('en-in')) || voices.find(v => /india|indian|hindi/i.test(v.name)) || voices[0];
-      if (pick) utt.voice = pick;
-      window.speechSynthesis.speak(utt);
+      
+      // Use small timeout to let cancel operation finish before speaking
+      setTimeout(() => {
+        const utt = new SpeechSynthesisUtterance(text);
+        utt.lang = 'en-IN';
+        utt.rate = 0.95; 
+        utt.pitch = 1.0;
+        utt.volume = 1.0;
+        
+        const voices = window.speechSynthesis.getVoices();
+        if (voices && voices.length > 0) {
+          const pick = voices.find(v => v.lang && v.lang.toLowerCase().startsWith('en-in')) || 
+                       voices.find(v => /india|indian|hindi/i.test(v.name)) || 
+                       voices.find(v => v.lang && v.lang.toLowerCase().startsWith('en')) || 
+                       voices[0];
+          if (pick) utt.voice = pick;
+        }
+        window.speechSynthesis.speak(utt);
+      }, 80);
     } catch(e) { console.warn('TTS failed', e); }
   };
 
@@ -613,11 +669,32 @@ export default function MockInterview() {
         <div ref={interviewSectionRef} className="main-grid">
           <div className="left-panel">
             <div className="question-head">
-              <div>
-                <div className="q-title">{qIndex === -1 ? 'Ready to practice' : `Question ${qIndex+1} / ${questionBank.length}`}</div>
+              <div 
+                className="q-container-clickable" 
+                onClick={() => {
+                  const textToSpeak = qIndex >= 0 ? questionBank[qIndex]?.text : 'Ready to practice. Click Start to begin.';
+                  speakText(textToSpeak);
+                }}
+                title="Click to hear the question read out loud"
+              >
+                <div className="q-title">
+                  {qIndex === -1 ? 'Ready to practice' : `Question ${qIndex+1} / ${questionBank.length}`}
+                  {qIndex >= 0 && <span className="speaker-icon" aria-label="speaker">🔊</span>}
+                </div>
                 <div className="q-prompt">{qIndex === -1 ? 'Click Start to begin interview' : questionBank[qIndex]?.text}</div>
               </div>
-              <div className="small">Timer: <strong style={{marginLeft:8}}>{timeLeft}s</strong></div>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '8px' }}>
+                <div className="small">Timer: <strong style={{marginLeft:8}}>{timeLeft}s</strong></div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: '#06b6d4', cursor: 'pointer', userSelect: 'none' }}>
+                  <input 
+                    type="checkbox" 
+                    checked={bilingual} 
+                    onChange={(e) => setBilingual(e.target.checked)} 
+                    style={{ cursor: 'pointer', width: '15px', height: '15px', accentColor: '#06b6d4' }}
+                  />
+                  Bilingual Mode (Hinglish/English)
+                </label>
+              </div>
             </div>
 
             <div className="video-card">
@@ -671,6 +748,32 @@ export default function MockInterview() {
                 </div>
               </div>
             )}
+
+            {showFeedback && feedback && feedback.raw && feedback.raw.translated_text && (
+              <div className="feedback-section" style={{ borderLeft: '4px solid #3b82f6', background: 'rgba(59, 130, 246, 0.05)', marginTop: '20px' }}>
+                <h4 style={{ color: '#60a5fa', display: 'flex', alignItems: 'center', gap: '8px', margin: '0 0 8px 0' }}>
+                  🌍 Language Inclusivity Normalization
+                </h4>
+                <div style={{ fontSize: '13px', color: '#9fb6c7', lineHeight: '1.4', marginBottom: '8px' }}>
+                  Hinglish mix-code speech detected. Translated to formal English to evaluate core reasoning capability fairly.
+                </div>
+                <div style={{ fontSize: '14px', color: '#fff', fontStyle: 'italic', padding: '8px', background: 'rgba(0,0,0,0.2)', borderRadius: '6px', lineHeight: '1.4' }}>
+                  <strong>Graded Translation:</strong> "{feedback.raw.translated_text}"
+                </div>
+              </div>
+            )}
+
+            {showFeedback && feedback && feedback.overall !== undefined && (
+              <div style={{ marginTop: 20, padding: '12px 16px', backgroundColor: 'rgba(16, 185, 129, 0.05)', border: '1px dashed rgba(16, 185, 129, 0.3)', borderRadius: 12, display: 'flex', gap: 10, alignItems: 'center' }}>
+                <div style={{ color: '#10b981', display: 'flex', alignItems: 'center', flexShrink: 0 }}>
+                  <svg width="20" height="20" fill="currentColor" viewBox="0 0 20 20"><path fillRule="evenodd" d="M2.166 4.9L10 1.154 17.834 4.9A2 2 0 0119 6.7v5.3a8 8 0 01-9 7.9 8 8 0 01-9-7.9V6.7a2 2 0 011.166-1.8zm7.834 2.8a1 1 0 00-1 1v3a1 1 0 002 0v-3a1 1 0 00-1-1z" clipRule="evenodd"/></svg>
+                </div>
+                <div style={{ fontSize: 12, color: '#a7f3d0', lineHeight: 1.4, textAlign: 'left' }}>
+                  <strong>Responsible AI Audited:</strong> Vocal pitch metrics are normalized using relative standard z-scores, shielding against gender pitch frequency bias and regional accent volume spikes.
+                </div>
+              </div>
+            )}
+
 
             {showFeedback && feedback && feedback.strengths && feedback.strengths.length > 0 && (
               <div className="feedback-section strength">

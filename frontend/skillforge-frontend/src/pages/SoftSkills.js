@@ -5,6 +5,7 @@ import axios from 'axios';
 
 const SoftSkills = () => {
   const [activeTab, setActiveTab] = useState(0);
+  const [bilingual, setBilingual] = useState(false);
   const [userAnswers, setUserAnswers] = useState({});
   const [questions, setQuestions] = useState({ grammar: [], leadership: [], teamwork: [] });
   const [topics, setTopics] = useState([]);
@@ -81,11 +82,16 @@ const SoftSkills = () => {
       const response = await axios.post('http://127.0.0.1:5000/api/discussion/respond', {
         topic: selectedTopic,
         userInput: transcript.trim(),
-        conversation: [...conversation, userMessage]
+        conversation: [...conversation, userMessage],
+        bilingual: bilingual
       });
       const aiResponse = response.data.response || `Interesting point on ${selectedTopic}. What are your thoughts on the solutions?`;
+      const transText = response.data.translated_text;
 
       if (isMountedRef.current) {
+        if (transText) {
+          userMessage.translatedText = transText;
+        }
         setConversation(prev => [...prev, { role: 'ai', text: aiResponse, timestamp: new Date() }]);
         speak(aiResponse);
       }
@@ -366,11 +372,28 @@ const SoftSkills = () => {
         </div>
       ) : (
         <div className="question-card">
-          <p className="question-text"><strong>Topic:</strong> {selectedTopic}</p>
-          <div className="conversation-log">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem', marginBottom: '1.5rem', borderBottom: '1px solid rgba(255,255,255,0.1)', paddingBottom: '1rem' }}>
+            <p className="question-text" style={{ margin: 0 }}><strong>Topic:</strong> {selectedTopic}</p>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', color: '#06b6d4', cursor: 'pointer', userSelect: 'none' }}>
+              <input 
+                type="checkbox" 
+                checked={bilingual} 
+                onChange={(e) => setBilingual(e.target.checked)} 
+                style={{ cursor: 'pointer', width: '15px', height: '15px', accentColor: '#06b6d4' }}
+              />
+              Bilingual Mode (Hinglish/English)
+            </label>
+          </div>
+          
+          <div className="conversation-log" style={{ background: '#0b1622', border: '1px solid #1a2f44', borderRadius: '12px' }}>
             {conversation.map((msg, idx) => (
-              <div key={idx} className={`msg ${msg.role}`}>
+              <div key={idx} className={`msg ${msg.role}`} style={{ padding: '1rem', borderRadius: '10px', marginBottom: '1rem' }}>
                 <strong>{msg.role === 'user' ? 'You' : 'AI'}:</strong> {msg.text}
+                {msg.role === 'user' && msg.translatedText && (
+                  <div style={{ fontSize: '0.85em', color: '#60a5fa', fontStyle: 'italic', marginTop: '6px', borderTop: '1px dashed rgba(96, 165, 250, 0.3)', paddingTop: '4px', textAlign: 'right' }}>
+                    🌍 Translated: "{msg.translatedText}"
+                  </div>
+                )}
               </div>
             ))}
           </div>

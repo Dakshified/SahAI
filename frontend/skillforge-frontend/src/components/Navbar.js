@@ -15,6 +15,7 @@ const Navbar = ({ isMenuOpen, toggleMenu, isAuthenticated, user, onLogout }) => 
     { path: '/aptitude-tests', label: 'Aptitude Tests' },
     { path: '/gamification', label: 'Gamification' },
     { path: '/profile', label: 'Profile' },
+    { path: '/institution', label: 'Recruiter Hub' },
   ];
 
   const sidebarVariants = {

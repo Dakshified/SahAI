@@ -3,11 +3,53 @@ import spacy
 import re
 import random
 import os
+import json
 from openai import OpenAI  # Groq via OpenAI client
-client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=os.getenv('GROQ_API_KEY', ''))
+
+GROQ_API_KEY = os.getenv('GROQ_API_KEY', '')
+if GROQ_API_KEY:
+    client = OpenAI(base_url="https://api.groq.com/openai/v1", api_key=GROQ_API_KEY)
+else:
+    client = None
+    print("Warning: GROQ_API_KEY is not set. Groq-powered NLP enhancements will be disabled.")
 
 model = SentenceTransformer('all-MiniLM-L6-v2')
 nlp = spacy.load("en_core_web_sm")
+
+def translate_hinglish_to_english(text):
+    if not text.strip() or client is None:
+        return text
+    try:
+        # Detect mix of Hindi and English (Hinglish/transliterated words like 'karna', 'hoga', 'kaam', etc.)
+        hinglish_words = ["karna", "hoga", "kaam", "kiya", "samajh", "tayaari", "badhana", "tarah", "karne", "sath", "mujhe", "mera", "hum"]
+        has_hinglish = any(w in text.lower() for w in hinglish_words) or any(ord(char) > 127 for char in text) # Also check Devnagari
+        
+        if not has_hinglish:
+            return text
+            
+        prompt = f"""
+        Translate the following Hinglish (mixed Hindi-English / transliterated Hindi) response into standard, formal, professional English. 
+        Keep the meaning and core message identical, but optimize it for an interview answer.
+        Output ONLY the translated English text, with no extra explanations or commentary.
+        
+        Text to translate: "{text}"
+        """
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=300,
+            temperature=0.3
+        )
+        translated = resp.choices[0].message.content.strip()
+        # Strip outer quotes if present
+        if translated.startswith('"') and translated.endswith('"'):
+            translated = translated[1:-1]
+        print(f"Hinglish translation: '{text}' -> '{translated}'")
+        return translated
+    except Exception as e:
+        print(f"Hinglish translation error: {e}")
+        return text
+
 
 def compute_similarity(text_a, text_b):
     if not text_a.strip() or not text_b.strip(): return 0.0
@@ -70,13 +112,15 @@ def advanced_grammar_analysis(text):
     if avg_complex > 0.15: issues.insert(0, f"Grammar strength: Varied flair ({avg_complex:.1%} complex)—keeps 'em hooked!")
     
     # Groq Boost: Vagueness/Flow Quality
-    try:
-        quality_prompt = f"Analyze vagueness/sentence flow in: '{text[:500]}...' (100 words max). Flag issues; suggest 1 fix. JSON: {{'quality_score': 0-1, 'notes': 'brief note'}}"
-        resp = client.chat.completions.create(model="llama3.1-70b-versatile", messages=[{"role": "user", "content": quality_prompt}], max_tokens=100)
-        quality_json = json.loads(resp.choices[0].message.content)
-        quality_score = quality_json.get('quality_score', 0.7)
-        if quality_score < 0.6: issues.append(quality_json.get('notes', 'Tighten vagueness for sharper impact.'))
-    except: pass
+    if client is not None:
+        try:
+            quality_prompt = f"Analyze vagueness/sentence flow in: '{text[:500]}...' (100 words max). Flag issues; suggest 1 fix. JSON: {{'quality_score': 0-1, 'notes': 'brief note'}}"
+            resp = client.chat.completions.create(model="llama3.1-70b-versatile", messages=[{"role": "user", "content": quality_prompt}], max_tokens=100)
+            quality_json = json.loads(resp.choices[0].message.content)
+            quality_score = quality_json.get('quality_score', 0.7)
+            if quality_score < 0.6: issues.append(quality_json.get('notes', 'Tighten vagueness for sharper impact.'))
+        except Exception as e:
+            print(f"Groq grammar boost skipped: {e}")
     
     # Uncertainty
     if any(phrase in text.lower() for phrase in ["don't know", "sorry"]):
@@ -92,18 +136,20 @@ def detect_fillers(text):
     return len(fillers) + clusters
 
 def generate_expected_keywords(question, question_type):
-    try:
-        kw_prompt = f"List 5-8 key words/phrases for strong answer to '{question}' ({question_type}). JSON array only."
-        resp = client.chat.completions.create(model="llama3.1-70b-versatile", messages=[{"role": "user", "content": kw_prompt}], max_tokens=100)
-        return json.loads(resp.choices[0].message.content)
-    except:
-        fallbacks = {
-            'behavioral': ['challenge', 'action', 'result', 'learned', 'team', 'leadership'],
-            'strength': ['example', 'impact', 'quantify', 'relevant', 'consistent'],
-            'motivation': ['company', 'role', 'growth', 'contribute', 'passion'],
-            'default': ['experience', 'skills', 'teamwork', 'challenge']
-        }
-        return fallbacks.get(question_type, fallbacks['default'])
+    if client is not None:
+        try:
+            kw_prompt = f"List 5-8 key words/phrases for strong answer to '{question}' ({question_type}). JSON array only."
+            resp = client.chat.completions.create(model="llama3.1-70b-versatile", messages=[{"role": "user", "content": kw_prompt}], max_tokens=100)
+            return json.loads(resp.choices[0].message.content)
+        except Exception as e:
+            print(f"Groq keyword generation skipped: {e}")
+    fallbacks = {
+        'behavioral': ['challenge', 'action', 'result', 'learned', 'team', 'leadership'],
+        'strength': ['example', 'impact', 'quantify', 'relevant', 'consistent'],
+        'motivation': ['company', 'role', 'growth', 'contribute', 'passion'],
+        'default': ['experience', 'skills', 'teamwork', 'challenge']
+    }
+    return fallbacks.get(question_type, fallbacks['default'])
 
 def compute_keyword_coverage(user_words, expected_keywords):
     """Coverage score: Jaccard + partial matches. user_words is list of lowercased tokens."""

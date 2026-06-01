@@ -28,16 +28,22 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Groq Integration (pip install groq openai)
 from openai import OpenAI
-client = OpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=os.getenv('GROQ_API_KEY', '')  # Set your key in backend/.env
-)
+GROQ_API_KEY = os.getenv('GROQ_API_KEY', '')
+if GROQ_API_KEY:
+    client = OpenAI(
+        base_url="https://api.groq.com/openai/v1",
+        api_key=GROQ_API_KEY
+    )
+else:
+    client = None
+    print("Warning: GROQ_API_KEY is not set. Groq-powered AI feedback and TTS will be disabled or use fallback mode.")
 
 # Guarded imports with fallbacks
 try:
     from ai.nlp.nlp_analysis import (
         compute_similarity, generate_suggestions, advanced_grammar_analysis,
-        detect_fillers, generate_expected_keywords, compute_keyword_coverage
+        detect_fillers, generate_expected_keywords, compute_keyword_coverage,
+        translate_hinglish_to_english
     )
 except ImportError as e:
     print(f"NLP import error: {e}. Fallbacks active.")
@@ -55,6 +61,7 @@ except ImportError as e:
         user_set = set(user_kws)
         matches = sum(1 for kw in expected if any(word in kw.lower() for word in user_set))
         return matches / len(expected) if expected else 0
+    def translate_hinglish_to_english(t): return t
 
 try:
     from ai.speech.speech_analysis import analyze_vocal_enhanced
@@ -165,6 +172,8 @@ def analyze_sentiment_emotion(text):
     return sentiment, emotion
 
 def generate_discussion_reply(topic, user_input, conversation):
+    if client is None:
+        return "Interesting point! What makes you think that? Let's explore this further."
     try:
         prompt = f"""
         Topic: {topic}
@@ -200,7 +209,8 @@ def analyze():
         'pauses': 0, 'keyword_coverage': 0.0, 'wpm': 0, 'energy_variation': 0.0,
         'tempo_fluctuation': 0.0, 'jitter': 0.0, 'strengths': [], 'improvements': [], 'mock_tips': [],
         'example_answer': '', 'grammar': "Analysis in progress...", 'sentiment': "neutral",
-        'emotion': "neutral", 'vocal': "Analysis in progress...", 'blended_confidence': 0.0
+        'emotion': "neutral", 'vocal': "Analysis in progress...", 'blended_confidence': 0.0,
+        'translated_text': ''
     }
     
     try:
@@ -209,12 +219,19 @@ def analyze():
         js_conf = float(request.form.get('confidence', 0.5))
         question = request.form.get('question', '')
         question_type = request.form.get('question_type', 'default')
+        bilingual = request.form.get('bilingual', 'false').lower() == 'true'
 
         if not text and not audio_file:
             result['error'] = 'No input—let\'s hear your thoughts!'
             return jsonify(result), 400
 
+        original_text = text
+        if bilingual and text:
+            text = translate_hinglish_to_english(text)
+            result['translated_text'] = text if text != original_text else ''
+
         is_uncertain = any(phrase in text.lower() for phrase in ["don't know", "sorry", "unsure", "idk"])
+
 
         # Semantic
         result['semantic_similarity'] = compute_similarity(question, text)
@@ -276,6 +293,8 @@ def analyze():
 
         # Dynamic Groq LLM Feedback (robust parsing + safe fallback)
         try:
+            if client is None:
+                raise RuntimeError("No Groq API client available")
             print("Calling Groq LLM for feedback...")  # Debug
             prompt = f"""
             You are an expert mock interview coach—empathetic, encouraging, specific like a trusted mentor for Indian placements.
@@ -624,6 +643,89 @@ def get_profile(user_id):
     conn.close()
     return jsonify({'progress': progress, 'gamify': gamify})
 
+@app.route('/api/progress/profile/share/<path:user_id>', methods=['GET'])
+def get_shareable_profile(user_id):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT username, email, coins, badges FROM users WHERE id = ?", (user_id,))
+        user_row = c.fetchone()
+        if not user_row:
+            conn.close()
+            return jsonify({'error': 'User not found'}), 404
+        username, email, coins, badges = user_row
+        c.execute("SELECT * FROM user_progress WHERE user_id = ?", (user_id,))
+        progress = []
+        for r in c.fetchall():
+            details = {}
+            if len(r) > 6 and r[6]:
+                try: details = json.loads(r[6])
+                except: details = {}
+            progress.append({
+                'id': r[0],
+                'user_id': r[1],
+                'activity_type': r[2],
+                'activity_id': r[3],
+                'completed_at': r[4],
+                'score': r[5],
+                'details': details
+            })
+        c.execute("SELECT streak_days, total_completions, badges FROM user_gamification WHERE user_id = ?", (user_id,))
+        gam_row = c.fetchone()
+        gamify = {
+            'streak_days': gam_row[0] if gam_row else 0,
+            'total_completed': gam_row[1] if gam_row else 0,
+            'badges': json.loads(gam_row[2]) if gam_row and gam_row[2] else [],
+            'coins': coins
+        }
+        verification_hash = base64.b64encode(f"{email}-verified-by-skillforge-ai".encode()).decode()
+        conn.close()
+        return jsonify({
+            'username': username,
+            'email': email,
+            'progress': progress,
+            'gamify': gamify,
+            'verified': True,
+            'verification_hash': verification_hash
+        })
+    except Exception as e:
+        print("Public profile share route error:", e)
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/public/candidates', methods=['GET'])
+def get_public_candidates():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT id, username, coins, badges FROM users")
+        users = c.fetchall()
+        candidates = []
+        for u in users:
+            email, name, coins, badges_json = u
+            c.execute("SELECT activity_type, score FROM user_progress WHERE user_id = ?", (email,))
+            progress_rows = c.fetchall()
+            apt_scores = [r[1] for r in progress_rows if r[0] == 'aptitude']
+            mock_scores = [r[1] for r in progress_rows if r[0] == 'mock_interview']
+            debate_scores = [r[1] for r in progress_rows if r[0] in ['soft_skills', 'debate']]
+            avg_apt = int(sum(apt_scores)/len(apt_scores)) if apt_scores else 60
+            avg_mock = int(sum(mock_scores)/len(mock_scores)) if mock_scores else 70
+            avg_debate = int(sum(debate_scores)/len(debate_scores)) if debate_scores else 65
+            candidates.append({
+                'email': email,
+                'username': name,
+                'coins': coins,
+                'badges': json.loads(badges_json or '[]'),
+                'avg_aptitude': avg_apt,
+                'avg_mock': avg_mock,
+                'avg_debate': avg_debate
+            })
+        conn.close()
+        return jsonify(candidates)
+    except Exception as e:
+        print("Candidates fetch error:", e)
+        return jsonify({'error': str(e)}), 500
+
+
 # ADD THIS ROUTE IN YOUR app.py
 @app.route('/api/gamification/minigame', methods=['POST'])
 @jwt_required()
@@ -761,18 +863,25 @@ def discussion_respond():
         topic = data.get('topic', '')
         user_input = data.get('userInput', '').strip()
         conversation = data.get('conversation', [])
+        bilingual = data.get('bilingual', False)
 
         if not topic or not user_input:
             return jsonify({'error': 'Missing topic or input'}), 400
 
+        original_input = user_input
+        if bilingual and user_input:
+            user_input = translate_hinglish_to_english(user_input)
+
         relevance = compute_similarity(topic, user_input)
+
 
         ai_response = generate_discussion_reply(topic, user_input, conversation)
 
         return jsonify({
             'response': ai_response,
             'relevance': relevance,
-            'suggestions': generate_suggestions(user_input)
+            'suggestions': generate_suggestions(user_input),
+            'translated_text': user_input if user_input != original_input else ''
         })
     except Exception as e:
         print(f"Discussion respond error: {e}")
