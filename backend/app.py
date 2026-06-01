@@ -77,10 +77,10 @@ except ImportError:
 
 app = Flask(__name__)
 CORS(app)
-app.config['JWT_SECRET_KEY'] = 'skillforge-secret-2025'
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'skillforge-secret-2025')
 jwt = JWTManager(app)
 
-DB_PATH = '../skillforge.db'
+DB_PATH = os.getenv('DB_PATH', os.path.join(os.path.dirname(__file__), 'skillforge.db'))
 
 # SpaCy
 try:
@@ -986,4 +986,7 @@ def submit_aptitude_answer():
         return jsonify({"error": "Failed to process answer"}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)  
+    app.run(
+        debug=(os.getenv('FLASK_DEBUG', 'False').lower() in ('1', 'true', 'yes')),
+        port=int(os.getenv('PORT', 5000))
+    )

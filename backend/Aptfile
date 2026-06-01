@@ -1,0 +1,5 @@
+ffmpeg
+libsndfile1
+build-essential
+python3-dev
+libsndfile1-dev
