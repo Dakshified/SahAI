@@ -3,13 +3,9 @@ from flask_cors import CORS
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
 import spacy
-import librosa
-import sqlite3
-import numpy as np
-from pydub import AudioSegment
-import io
-import re
-from sklearn.metrics.pairwise import cosine_similarity
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+import db
 import json
 from datetime import date
 from typing import List, Dict
@@ -19,6 +15,8 @@ import traceback
 import random
 import base64  # For TTS b64 if needed
 import warnings  # To suppress deprecation warnings
+import io
+import re
 
 from dotenv import load_dotenv
 load_dotenv()  # Loads .env
@@ -37,6 +35,70 @@ if GROQ_API_KEY:
 else:
     client = None
     print("Warning: GROQ_API_KEY is not set. Groq-powered AI feedback and TTS will be disabled or use fallback mode.")
+
+# Auto-detect a preferred model for LLM calls (prefer smaller/fast models when available)
+SELECTED_MODEL = None
+if client is not None:
+    try:
+        models_resp = client.models.list()
+        model_ids = []
+        if hasattr(models_resp, 'data'):
+            for m in models_resp.data:
+                mid = getattr(m, 'id', None) or (m.get('id') if isinstance(m, dict) else None)
+                if mid:
+                    model_ids.append(mid)
+        elif isinstance(models_resp, dict):
+            for m in models_resp.get('data', []):
+                if isinstance(m, dict):
+                    model_ids.append(m.get('id'))
+
+        preferred = [
+            "llama-3.1-8b-instant", "llama-3.1-8b", "llama-3.3-70b-versatile",
+            "llama3.1-70b-versatile", "gpt-4o-mini", "gpt-4o"
+        ]
+        for p in preferred:
+            if p in model_ids:
+                SELECTED_MODEL = p
+                break
+        if not SELECTED_MODEL and model_ids:
+            # pick a small-ish model if possible
+            for m in model_ids:
+                if 'instant' in m or '8b' in m or 'llama' in m:
+                    SELECTED_MODEL = m
+                    break
+        if not SELECTED_MODEL and model_ids:
+            SELECTED_MODEL = model_ids[0]
+
+        if SELECTED_MODEL:
+            os.environ['GROQ_PREFERRED_MODEL'] = SELECTED_MODEL
+            print(f"Selected Groq model for runtime: {SELECTED_MODEL}")
+        else:
+            print("No Groq models discovered for this key.")
+    except Exception as e:
+        print(f"Model autodiscovery failed: {e}")
+
+
+def safe_chat_completion(model, messages, max_tokens=150, temperature=0.7, timeout=20):
+    """Run a chat completion in a background thread and respect a timeout to avoid blocking workers."""
+    if client is None:
+        return None
+    try:
+        import concurrent.futures
+        def _call():
+            return client.chat.completions.create(model=model, messages=messages, max_tokens=max_tokens, temperature=temperature)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_call)
+            try:
+                return fut.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                print(f"LLM call timed out after {timeout}s for model {model}")
+                return None
+            except Exception as e:
+                print(f"LLM call error: {e}")
+                return None
+    except Exception as e:
+        print(f"safe_chat_completion wrapper error: {e}")
+        return None
 
 # Guarded imports with fallbacks
 try:
@@ -77,10 +139,10 @@ except ImportError:
 
 app = Flask(__name__)
 CORS(app)
-app.config['JWT_SECRET_KEY'] = 'skillforge-secret-2025'
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'skillforge-secret-2025')
 jwt = JWTManager(app)
 
-DB_PATH = '../skillforge.db'
+DB_PATH = os.getenv('DB_PATH', os.path.join(os.path.dirname(__file__), 'skillforge.db'))
 
 # SpaCy
 try:
@@ -91,76 +153,7 @@ except OSError:
 
 ADMIN_EMAILS = ['sanskar.chitnis241@vit.edu']
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id TEXT PRIMARY KEY,
-            username TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            coins INTEGER DEFAULT 0,
-            badges TEXT DEFAULT '[]'
-        )
-    ''')
-    # Updated user_progress with details column
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS user_progress (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            activity_type TEXT NOT NULL,
-            activity_id TEXT NOT NULL,
-            completed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            score INTEGER DEFAULT 0,
-            details TEXT DEFAULT '{}',
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        )
-    ''')
-    # If table exists without details, add it safely
-    try:
-        c.execute("ALTER TABLE user_progress ADD COLUMN details TEXT DEFAULT '{}'")
-    except sqlite3.OperationalError:
-        pass  # Column already exists
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS user_gamification (
-            user_id TEXT PRIMARY KEY,
-            streak_days INTEGER DEFAULT 0,
-            total_completions INTEGER DEFAULT 0,
-            badges TEXT DEFAULT '[]',
-            last_activity TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS leaderboard (
-            user_id TEXT PRIMARY KEY,
-            rank_score INTEGER DEFAULT 0,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS contacts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL,
-            message TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS feedbacks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            feedback TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    c.execute("INSERT OR IGNORE INTO users VALUES ('test@example.com', 'Test User', 'test@example.com', ?, 0, '[]')", (generate_password_hash('dummy'),))
-    conn.commit()
-    conn.close()
-    print("DB initialized.")
-
-init_db()
+db.init_db()
 
 def analyze_sentiment_emotion(text):
     if not nlp or not text.strip(): return "neutral", "hesitant"
@@ -184,13 +177,14 @@ def generate_discussion_reply(topic, user_input, conversation):
 
         Respond as an engaging discussion partner, 1-2 sentences, insightful and encouraging.
         """
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=150,
-            temperature=0.8
-        )
-        return response.choices[0].message.content.strip()
+        model_to_use = SELECTED_MODEL or os.getenv('GROQ_PREFERRED_MODEL') or "llama-3.1-8b-instant"
+        resp = safe_chat_completion(model_to_use, [{"role": "user", "content": prompt}], max_tokens=150, temperature=0.8, timeout=20)
+        if resp is None:
+            return "Hmm, I'm having trouble reaching the AI right now—let's try again in a moment."
+        try:
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            return str(resp)
     except Exception as e:
         print(f"Discussion reply error: {e}")
         return "Interesting point! What makes you think that? Let's explore this further."
@@ -254,7 +248,8 @@ def analyze():
         result['pauses'] = 0; result['fluency'] = 0.5; result['vocal'] = "Voice analysis pending—full recording unlocks your unique rhythm!"
         result['blended_confidence'] = js_conf * 0.5; result['wpm'] = 0; result['energy_variation'] = 0.0
         result['tempo_fluctuation'] = 0.0; result['jitter'] = 0.0
-        if audio_file:
+        audio_enabled = os.getenv('AUDIO_ENABLED', 'true').lower() in ('1','true','yes')
+        if audio_file and audio_enabled:
             try:
                 temp_dir = tempfile.gettempdir()
                 temp_path = os.path.join(temp_dir, f"temp_audio_{random.randint(1000,9999)}.wav")
@@ -326,12 +321,12 @@ def analyze():
             Indian context: Suggest cultural fits like confident eye contact in panels.
             """
 
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=400,
-                temperature=0.7
-            )
+            model_to_use = SELECTED_MODEL or os.getenv('GROQ_PREFERRED_MODEL') or "llama-3.1-8b-instant"
+            response = safe_chat_completion(model_to_use, [{"role": "user", "content": prompt}], max_tokens=400, temperature=0.7, timeout=30)
+
+            if response is None:
+                print("LLM returned no response (timeout or error); using heuristic fallback")
+                raise RuntimeError("LLM request timeout or failure")
 
             # Robust extraction of text from various possible response shapes
             raw_text = ""
@@ -445,25 +440,21 @@ def award_coins():
         base_coins = 10
         bonus = 5 if data.get('confidence', 0) > 0.8 and data.get('relevance', 0) > 0.6 else 0
         total = base_coins + bonus
-        
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("UPDATE users SET coins = coins + ? WHERE id = ?", (total, user_id))
-        coin_row = c.execute("SELECT coins FROM users WHERE id = ?", (user_id,)).fetchone()
-        new_coins = coin_row[0] if coin_row else 0
-        
-        badge_row = c.execute("SELECT badges FROM users WHERE id = ?", (user_id,)).fetchone()
-        current_badges = json.loads(badge_row[0] if badge_row else '[]')
-        questions_completed = data.get('questionIndex', 0) + 1
-        new_badges = []
-        if questions_completed % 5 == 0 and 'Bronze Speaker' not in current_badges:
-            new_badges.append('Bronze Speaker')
-            current_badges.append('Bronze Speaker')
-            c.execute("UPDATE users SET badges = ? WHERE id = ?", (json.dumps(current_badges), user_id))
-        
-        conn.commit()
-        conn.close()
-        
+        # Use SQLAlchemy engine for DB operations (works with Postgres or sqlite)
+        with db.engine.begin() as conn:
+            conn.execute(text("UPDATE users SET coins = coins + :inc WHERE id = :id"), {"inc": total, "id": user_id})
+            coin_row = conn.execute(text("SELECT coins FROM users WHERE id = :id"), {"id": user_id}).fetchone()
+            new_coins = coin_row[0] if coin_row else 0
+
+            badge_row = conn.execute(text("SELECT badges FROM users WHERE id = :id"), {"id": user_id}).fetchone()
+            current_badges = json.loads(badge_row[0]) if badge_row and badge_row[0] else []
+            questions_completed = data.get('questionIndex', 0) + 1
+            new_badges = []
+            if questions_completed % 5 == 0 and 'Bronze Speaker' not in current_badges:
+                new_badges.append('Bronze Speaker')
+                current_badges.append('Bronze Speaker')
+                conn.execute(text("UPDATE users SET badges = :badges WHERE id = :id"), {"badges": json.dumps(current_badges), "id": user_id})
+
         return jsonify({'coins': new_coins, 'newBadges': new_badges})
     except Exception as e:
         print("Error in /api/award-coins:", e)
@@ -475,30 +466,22 @@ def signup():
     username = data['username']
     email = data['email']
     password = generate_password_hash(data['password'])
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
     try:
-        c.execute("INSERT INTO users (id, username, email, password) VALUES (?, ?, ?, ?)", (email, username, email, password))
-        conn.commit()
+        with db.engine.begin() as conn:
+            conn.execute(text("INSERT INTO users (id, username, email, password) VALUES (:id, :username, :email, :password)"),
+                         {"id": email, "username": username, "email": email, "password": password})
         access_token = create_access_token(identity=email)
         return jsonify({'token': access_token, 'user': email, 'username': username, 'msg': 'Signed up!'})
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return jsonify({'error': 'User exists'}), 400
-    finally:
-        conn.close()
 
 @app.route('/api/auth/login', methods=['POST'])
 def login():
     data = request.json
     email = data['email']
     password = data['password']
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT password, username FROM users WHERE id = ?", (email,))
-    row = c.fetchone()
-    conn.close()
+    with db.engine.connect() as conn:
+        row = conn.execute(text("SELECT password, username FROM users WHERE id = :id"), {"id": email}).fetchone()
     if row and check_password_hash(row[0], password):
         access_token = create_access_token(identity=email)
         return jsonify({'token': access_token, 'user': email, 'username': row[1], 'msg': 'Logged in!'})
@@ -515,55 +498,35 @@ def complete_activity():
         score = data.get('score', 0)
         details = json.dumps(data.get('details', {}))
 
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-
-        # Only count aptitude practice questions (not full tests or behavioral)
+        # Use SQLAlchemy for DB operations
         is_practice_question = (activity_type == 'aptitude' and str(activity_id).isdigit())
+        new_streak = 0
+        rank_score = 0
+        with db.engine.begin() as conn:
+            conn.execute(text("INSERT INTO user_progress (user_id, activity_type, activity_id, score, details) VALUES (:user_id, :activity_type, :activity_id, :score, :details)"),
+                         {"user_id": user_id, "activity_type": activity_type, "activity_id": str(activity_id), "score": score, "details": details})
 
-        # Insert progress entry
-        c.execute("""
-            INSERT INTO user_progress 
-            (user_id, activity_type, activity_id, score, details) 
-            VALUES (?, ?, ?, ?, ?)
-        """, (user_id, activity_type, str(activity_id), score, details))
-
-        # === Only increment streak & score for practice questions ===
-        if is_practice_question:
-            today = date.today().isoformat()
-
-            # Get current gamification row
-            c.execute("SELECT streak_days, last_activity FROM user_gamification WHERE user_id = ?", (user_id,))
-            row = c.fetchone()
-
-            new_streak = 1
-            if row and row[1] == today:
-                new_streak = row[0] + 1  # Continue streak
-            elif row and row[1]:
-                # Could check if yesterday, but for simplicity: reset if not today
+            if is_practice_question:
+                today = date.today().isoformat()
+                row = conn.execute(text("SELECT streak_days, total_completions, last_activity FROM user_gamification WHERE user_id = :id"), {"id": user_id}).fetchone()
                 new_streak = 1
+                if row and row[2] == today:
+                    new_streak = (row[0] or 0) + 1
+                # Update or insert gamification
+                if row:
+                    total_completions = (row[1] or 0) + 1
+                    conn.execute(text("UPDATE user_gamification SET streak_days = :streak, last_activity = :last, total_completions = :total WHERE user_id = :id"),
+                                 {"streak": new_streak, "last": today, "total": total_completions, "id": user_id})
+                else:
+                    conn.execute(text("INSERT INTO user_gamification (user_id, streak_days, last_activity, total_completions, badges) VALUES (:id, :streak, :last, :total, :badges)"),
+                                 {"id": user_id, "streak": new_streak, "last": today, "total": 1, "badges": '[]'})
 
-            # Update streak_days = number of practice questions solved
-            c.execute("""
-                INSERT OR REPLACE INTO user_gamification 
-                (user_id, streak_days, last_activity, total_completions, badges)
-                VALUES (?, ?, ?, 
-                    COALESCE((SELECT total_completions FROM user_gamification WHERE user_id = ?), 0) + 1,
-                    COALESCE((SELECT badges FROM user_gamification WHERE user_id = ?), '[]')
-                )
-            """, (user_id, new_streak, today, user_id, user_id))
-
-            # Update rank_score = practice questions × 100
-            practice_count = new_streak  # Since we increment only on practice Qs
-            rank_score = practice_count * 100
-
-            c.execute("""
-                INSERT OR REPLACE INTO leaderboard (user_id, rank_score)
-                VALUES (?, ?)
-            """, (user_id, rank_score))
-
-        conn.commit()
-        conn.close()
+                rank_score = new_streak * 100
+                existing = conn.execute(text("SELECT user_id FROM leaderboard WHERE user_id = :id"), {"id": user_id}).fetchone()
+                if existing:
+                    conn.execute(text("UPDATE leaderboard SET rank_score = :score WHERE user_id = :id"), {"score": rank_score, "id": user_id})
+                else:
+                    conn.execute(text("INSERT INTO leaderboard (user_id, rank_score) VALUES (:id, :score)"), {"id": user_id, "score": rank_score})
 
         return jsonify({
             'success': True,
@@ -579,88 +542,16 @@ def complete_activity():
 @jwt_required()
 def get_my_profile():
     user_id = get_jwt_identity()  # This is the logged-in user's email/id
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-
-    # === Get Progress ===
-    c.execute("SELECT * FROM user_progress WHERE user_id = ?", (user_id,))
-    progress = []
-    for r in c.fetchall():
-        details = {}
-        if len(r) > 6 and r[6]:  # details column exists and not null
-            try:
-                details = json.loads(r[6])
-            except:
-                details = {}
-        progress.append({
-            'id': r[0],
-            'user_id': r[1],
-            'activity_type': r[2],
-            'activity_id': r[3],
-            'completed_at': r[4],
-            'score': r[5],
-            'details': details
-        })
-
-    # === Get Gamification Stats ===
-    c.execute("SELECT streak_days, total_completions, badges FROM user_gamification WHERE user_id = ?", (user_id,))
-    gam_row = c.fetchone()
-    gamify = {
-        'streak_days': gam_row[0] if gam_row else 0,
-        'total_completed': gam_row[1] if gam_row else 0,
-        'badges': json.loads(gam_row[2]) if gam_row and gam_row[2] else []
-    }
-
-    # === Get Coins ===
-    c.execute("SELECT coins FROM users WHERE id = ?", (user_id,))
-    coin_row = c.fetchone()
-    gamify['coins'] = coin_row[0] if coin_row else 0
-
-    conn.close()
-
-    return jsonify({
-        'progress': progress,
-        'gamify': gamify
-    })
-
-@app.route('/api/progress/profile/<path:user_id>', methods=['GET'])
-@jwt_required()
-def get_profile(user_id):
-    current_user = get_jwt_identity()
-    if current_user != user_id:
-        return jsonify({'error': 'Unauthorized'}), 403
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM user_progress WHERE user_id = ?", (user_id,))
-    progress = [{'id': r[0], 'user_id': r[1], 'activity_type': r[2], 'activity_id': r[3], 'completed_at': r[4], 'score': r[5], 'details': json.loads(r[6]) if len(r) > 6 else {}} for r in c.fetchall()]
-    c.execute("SELECT * FROM user_gamification WHERE user_id = ?", (user_id,))
-    gamify_row = c.fetchone()
-    gamify = {'streak_days': gamify_row[1] if gamify_row else 0, 'total_completed': gamify_row[2] if gamify_row else 0, 'badges': json.loads(gamify_row[3] if gamify_row else '[]')}
-    c.execute("SELECT coins FROM users WHERE id = ?", (user_id,))
-    coin_row = c.fetchone()
-    gamify['coins'] = coin_row[0] if coin_row else 0
-    conn.close()
-    return jsonify({'progress': progress, 'gamify': gamify})
-
-@app.route('/api/progress/profile/share/<path:user_id>', methods=['GET'])
-def get_shareable_profile(user_id):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT username, email, coins, badges FROM users WHERE id = ?", (user_id,))
-        user_row = c.fetchone()
-        if not user_row:
-            conn.close()
-            return jsonify({'error': 'User not found'}), 404
-        username, email, coins, badges = user_row
-        c.execute("SELECT * FROM user_progress WHERE user_id = ?", (user_id,))
+    with db.engine.connect() as conn:
+        rows = conn.execute(text("SELECT id, user_id, activity_type, activity_id, completed_at, score, details FROM user_progress WHERE user_id = :id"), {"id": user_id}).fetchall()
         progress = []
-        for r in c.fetchall():
+        for r in rows:
             details = {}
-            if len(r) > 6 and r[6]:
-                try: details = json.loads(r[6])
-                except: details = {}
+            try:
+                if r[6]:
+                    details = json.loads(r[6])
+            except Exception:
+                details = {}
             progress.append({
                 'id': r[0],
                 'user_id': r[1],
@@ -670,16 +561,71 @@ def get_shareable_profile(user_id):
                 'score': r[5],
                 'details': details
             })
-        c.execute("SELECT streak_days, total_completions, badges FROM user_gamification WHERE user_id = ?", (user_id,))
-        gam_row = c.fetchone()
+
+        gam_row = conn.execute(text("SELECT streak_days, total_completions, badges FROM user_gamification WHERE user_id = :id"), {"id": user_id}).fetchone()
         gamify = {
             'streak_days': gam_row[0] if gam_row else 0,
             'total_completed': gam_row[1] if gam_row else 0,
-            'badges': json.loads(gam_row[2]) if gam_row and gam_row[2] else [],
-            'coins': coins
+            'badges': json.loads(gam_row[2]) if gam_row and gam_row[2] else []
         }
-        verification_hash = base64.b64encode(f"{email}-verified-by-skillforge-ai".encode()).decode()
-        conn.close()
+
+        coin_row = conn.execute(text("SELECT coins FROM users WHERE id = :id"), {"id": user_id}).fetchone()
+        gamify['coins'] = coin_row[0] if coin_row else 0
+
+    return jsonify({'progress': progress, 'gamify': gamify})
+
+@app.route('/api/progress/profile/<path:user_id>', methods=['GET'])
+@jwt_required()
+def get_profile(user_id):
+    current_user = get_jwt_identity()
+    if current_user != user_id:
+        return jsonify({'error': 'Unauthorized'}), 403
+    with db.engine.connect() as conn:
+        rows = conn.execute(text("SELECT id, user_id, activity_type, activity_id, completed_at, score, details FROM user_progress WHERE user_id = :id"), {"id": user_id}).fetchall()
+        progress = []
+        for r in rows:
+            try:
+                details = json.loads(r[6]) if r[6] else {}
+            except Exception:
+                details = {}
+            progress.append({'id': r[0], 'user_id': r[1], 'activity_type': r[2], 'activity_id': r[3], 'completed_at': r[4], 'score': r[5], 'details': details})
+
+        gamify_row = conn.execute(text("SELECT user_id, streak_days, total_completions, badges FROM user_gamification WHERE user_id = :id"), {"id": user_id}).fetchone()
+        gamify = {'streak_days': gamify_row[1] if gamify_row else 0, 'total_completed': gamify_row[2] if gamify_row else 0, 'badges': json.loads(gamify_row[3]) if gamify_row and gamify_row[3] else []}
+
+        coin_row = conn.execute(text("SELECT coins FROM users WHERE id = :id"), {"id": user_id}).fetchone()
+        gamify['coins'] = coin_row[0] if coin_row else 0
+
+    return jsonify({'progress': progress, 'gamify': gamify})
+
+@app.route('/api/progress/profile/share/<path:user_id>', methods=['GET'])
+def get_shareable_profile(user_id):
+    try:
+        with db.engine.connect() as conn:
+            user_row = conn.execute(text("SELECT username, email, coins, badges FROM users WHERE id = :id"), {"id": user_id}).fetchone()
+            if not user_row:
+                return jsonify({'error': 'User not found'}), 404
+            username, email, coins, badges = user_row
+            rows = conn.execute(text("SELECT id, user_id, activity_type, activity_id, completed_at, score, details FROM user_progress WHERE user_id = :id"), {"id": user_id}).fetchall()
+            progress = []
+            for r in rows:
+                details = {}
+                try:
+                    if r[6]:
+                        details = json.loads(r[6])
+                except Exception:
+                    details = {}
+                progress.append({
+                    'id': r[0], 'user_id': r[1], 'activity_type': r[2], 'activity_id': r[3], 'completed_at': r[4], 'score': r[5], 'details': details
+                })
+            gam_row = conn.execute(text("SELECT streak_days, total_completions, badges FROM user_gamification WHERE user_id = :id"), {"id": user_id}).fetchone()
+            gamify = {
+                'streak_days': gam_row[0] if gam_row else 0,
+                'total_completed': gam_row[1] if gam_row else 0,
+                'badges': json.loads(gam_row[2]) if gam_row and gam_row[2] else [],
+                'coins': coins
+            }
+            verification_hash = base64.b64encode(f"{email}-verified-by-skillforge-ai".encode()).decode()
         return jsonify({
             'username': username,
             'email': email,
@@ -695,31 +641,27 @@ def get_shareable_profile(user_id):
 @app.route('/api/public/candidates', methods=['GET'])
 def get_public_candidates():
     try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT id, username, coins, badges FROM users")
-        users = c.fetchall()
         candidates = []
-        for u in users:
-            email, name, coins, badges_json = u
-            c.execute("SELECT activity_type, score FROM user_progress WHERE user_id = ?", (email,))
-            progress_rows = c.fetchall()
-            apt_scores = [r[1] for r in progress_rows if r[0] == 'aptitude']
-            mock_scores = [r[1] for r in progress_rows if r[0] == 'mock_interview']
-            debate_scores = [r[1] for r in progress_rows if r[0] in ['soft_skills', 'debate']]
-            avg_apt = int(sum(apt_scores)/len(apt_scores)) if apt_scores else 60
-            avg_mock = int(sum(mock_scores)/len(mock_scores)) if mock_scores else 70
-            avg_debate = int(sum(debate_scores)/len(debate_scores)) if debate_scores else 65
-            candidates.append({
-                'email': email,
-                'username': name,
-                'coins': coins,
-                'badges': json.loads(badges_json or '[]'),
-                'avg_aptitude': avg_apt,
-                'avg_mock': avg_mock,
-                'avg_debate': avg_debate
-            })
-        conn.close()
+        with db.engine.connect() as conn:
+            users = conn.execute(text("SELECT id, username, coins, badges FROM users")).fetchall()
+            for u in users:
+                email, name, coins, badges_json = u
+                progress_rows = conn.execute(text("SELECT activity_type, score FROM user_progress WHERE user_id = :id"), {"id": email}).fetchall()
+                apt_scores = [r[1] for r in progress_rows if r[0] == 'aptitude']
+                mock_scores = [r[1] for r in progress_rows if r[0] == 'mock_interview']
+                debate_scores = [r[1] for r in progress_rows if r[0] in ['soft_skills', 'debate']]
+                avg_apt = int(sum(apt_scores)/len(apt_scores)) if apt_scores else 60
+                avg_mock = int(sum(mock_scores)/len(mock_scores)) if mock_scores else 70
+                avg_debate = int(sum(debate_scores)/len(debate_scores)) if debate_scores else 65
+                candidates.append({
+                    'email': email,
+                    'username': name,
+                    'coins': coins,
+                    'badges': json.loads(badges_json or '[]'),
+                    'avg_aptitude': avg_apt,
+                    'avg_mock': avg_mock,
+                    'avg_debate': avg_debate
+                })
         return jsonify(candidates)
     except Exception as e:
         print("Candidates fetch error:", e)
@@ -734,27 +676,15 @@ def award_minigame_coins():
         user_id = get_jwt_identity()
         data = request.json
         reward = data.get('reward', 50)
-
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        
-        # Add coins
-        c.execute("UPDATE users SET coins = coins + ? WHERE id = ?", (reward, user_id))
-        
-        # Update total completions (for level)
-        c.execute("""
-            INSERT OR REPLACE INTO user_gamification 
-            (user_id, total_completions, streak_days, last_activity, badges) 
-            VALUES (?, 
-                COALESCE((SELECT total_completions FROM user_gamification WHERE user_id = ?), 0) + 1,
-                COALESCE((SELECT streak_days FROM user_gamification WHERE user_id = ?), 0),
-                date('now'),
-                COALESCE((SELECT badges FROM user_gamification WHERE user_id = ?), '[]')
-            )
-        """, (user_id, user_id, user_id, user_id))
-
-        conn.commit()
-        conn.close()
+        today = date.today().isoformat()
+        with db.engine.begin() as conn:
+            conn.execute(text("UPDATE users SET coins = coins + :reward WHERE id = :id"), {"reward": reward, "id": user_id})
+            row = conn.execute(text("SELECT total_completions, streak_days FROM user_gamification WHERE user_id = :id"), {"id": user_id}).fetchone()
+            if row:
+                total = (row[0] or 0) + 1
+                conn.execute(text("UPDATE user_gamification SET total_completions = :total, last_activity = :last WHERE user_id = :id"), {"total": total, "last": today, "id": user_id})
+            else:
+                conn.execute(text("INSERT INTO user_gamification (user_id, total_completions, streak_days, last_activity, badges) VALUES (:id, :total, :streak, :last, :badges)"), {"id": user_id, "total": 1, "streak": 0, "last": today, "badges": '[]'})
         return jsonify({"success": True, "coins_added": reward})
     except Exception as e:
         print("Mini-game reward error:", e)
@@ -763,27 +693,21 @@ def award_minigame_coins():
 @app.route('/api/progress/leaderboard', methods=['GET'])
 @jwt_required()
 def get_leaderboard():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        SELECT 
-            u.username,
-            COALESCE(g.streak_days, 0),
-            COALESCE(g.total_completions, 0),
-            COALESCE(l.rank_score, 0)
-        FROM users u
-        LEFT JOIN user_gamification g ON u.id = g.user_id
-        LEFT JOIN leaderboard l ON u.id = l.user_id
-        ORDER BY l.rank_score DESC, g.total_completions DESC
-        LIMIT 10
-    """)
-    rows = [{
-        'username': r[0] or 'Player',
-        'streak_days': r[1],
-        'total_completed': r[2],
-        'rank_score': r[3]
-    } for r in c.fetchall()]
-    conn.close()
+    with db.engine.connect() as conn:
+        q = text("""
+            SELECT 
+                u.username,
+                COALESCE(g.streak_days, 0),
+                COALESCE(g.total_completions, 0),
+                COALESCE(l.rank_score, 0)
+            FROM users u
+            LEFT JOIN user_gamification g ON u.id = g.user_id
+            LEFT JOIN leaderboard l ON u.id = l.user_id
+            ORDER BY l.rank_score DESC, g.total_completions DESC
+            LIMIT 10
+        """)
+        res = conn.execute(q).fetchall()
+        rows = [{'username': r[0] or 'Player', 'streak_days': r[1], 'total_completed': r[2], 'rank_score': r[3]} for r in res]
     return jsonify(rows)
 
 @app.route('/api/contact', methods=['POST'])
@@ -794,14 +718,8 @@ def contact():
             return jsonify({'error': 'Missing required fields'}), 400
         
         print(f"New Contact: Name={data['name']}, Email={data['email']}, Message={data['message']}")
-        
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("INSERT INTO contacts (name, email, message) VALUES (?, ?, ?)", 
-                  (data['name'], data['email'], data['message']))
-        conn.commit()
-        conn.close()
-        
+        with db.engine.begin() as conn:
+            conn.execute(text("INSERT INTO contacts (name, email, message) VALUES (:name, :email, :msg)"), {"name": data['name'], "email": data['email'], "msg": data['message']})
         return jsonify({'success': True, 'msg': 'Message sent successfully!'})
     except Exception as e:
         print(f"Contact error: {e}")
@@ -815,18 +733,100 @@ def feedback():
             return jsonify({'error': 'Missing required fields'}), 400
         
         print(f"New Feedback: Name={data['name']}, Feedback={data['feedback']}")
-        
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("INSERT INTO feedbacks (name, feedback) VALUES (?, ?)", 
-                  (data['name'], data['feedback']))
-        conn.commit()
-        conn.close()
-        
+        with db.engine.begin() as conn:
+            conn.execute(text("INSERT INTO feedbacks (name, feedback) VALUES (:name, :feedback)"), {"name": data['name'], "feedback": data['feedback']})
         return jsonify({'success': True, 'msg': 'Feedback submitted successfully!'})
     except Exception as e:
         print(f"Feedback error: {e}")
         return jsonify({'error': 'Failed to submit feedback'}), 500
+
+
+@app.route('/api/debug/llm', methods=['GET'])
+def debug_llm():
+    try:
+        if client is None:
+            return jsonify({'ok': False, 'error': 'GROQ_API_KEY not set or client not configured.'}), 200
+
+        # Try to list models available to this key and pick a usable one.
+        available_models = []
+        try:
+            models_resp = client.models.list()
+            # models_resp may be an object with .data or a dict
+            if hasattr(models_resp, 'data'):
+                for m in models_resp.data:
+                    mid = getattr(m, 'id', None) or (m.get('id') if isinstance(m, dict) else None)
+                    if mid:
+                        available_models.append(mid)
+            elif isinstance(models_resp, dict):
+                for m in models_resp.get('data', []):
+                    if isinstance(m, dict):
+                        available_models.append(m.get('id'))
+        except Exception as e:
+            print(f"Model list failed (non-fatal): {e}")
+
+        model_to_try = None
+        if available_models:
+            model_to_try = available_models[0]
+            print(f"Using available model: {model_to_try}")
+        else:
+            # Fallback candidate list (try until one works)
+            candidates = ["llama-3.3-70b-versatile", "llama3.1-70b-versatile", "gpt-4o-mini", "gpt-4o"]
+            for c in candidates:
+                try:
+                    tmp = safe_chat_completion(c, [{"role": "user", "content": "hi"}], max_tokens=5, timeout=5)
+                    if tmp is not None:
+                        model_to_try = c
+                        print(f"Fallback model usable: {c}")
+                        break
+                except Exception as ex:
+                    print(f"Model {c} not usable: {ex}")
+
+        if not model_to_try:
+            return jsonify({'ok': False, 'error': 'No accessible models found for this Groq key.', 'available_models_preview': available_models[:10]}), 200
+
+        # Make a small chat request to the chosen model
+        resp = safe_chat_completion(model_to_try, [{"role": "user", "content": "Say hello in one short sentence."}], max_tokens=40, temperature=0.2, timeout=8)
+        if resp is None:
+            return jsonify({'ok': False, 'error': 'LLM call timed out or failed', 'available_models_preview': available_models[:10]}), 200
+
+        # Robustly extract text from response
+        text = ''
+        try:
+            if hasattr(resp, 'choices') and resp.choices:
+                choice = resp.choices[0]
+                if hasattr(choice, 'message'):
+                    msg = choice.message
+                    text = getattr(msg, 'content', None) or (msg.get('content') if isinstance(msg, dict) else None)
+                if not text:
+                    text = getattr(choice, 'text', None) or (choice.get('text') if isinstance(choice, dict) else None)
+            if not text:
+                text = getattr(resp, 'text', None) or str(resp)
+            text = text.strip() if isinstance(text, str) else str(text)
+        except Exception:
+            text = str(resp)
+
+        return jsonify({'ok': True, 'model_used': model_to_try, 'model_response': text, 'available_models_preview': available_models[:10]}), 200
+    except Exception as e:
+        print(f"LLM debug error: {e}\n{traceback.format_exc()}")
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
+@app.route('/api/debug/env', methods=['GET'])
+def debug_env():
+    try:
+        key = os.getenv('GROQ_API_KEY')
+        present = bool(key and key.strip())
+        masked = None
+        if present:
+            k = key.strip()
+            if len(k) > 10:
+                masked = k[:4] + '...' + k[-4:]
+            else:
+                masked = '***'
+        return jsonify({'GROQ_API_KEY_present': present, 'GROQ_API_KEY_masked': masked}), 200
+    except Exception as e:
+        print(f"Env debug error: {e}\n{traceback.format_exc()}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/admin/contacts', methods=['GET'])
 @jwt_required()
@@ -834,12 +834,9 @@ def get_contacts():
     user_email = get_jwt_identity()
     if user_email not in ADMIN_EMAILS:
         return jsonify({'error': 'Access denied. Admin only.'}), 403
-    
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, name, email, message, created_at FROM contacts ORDER BY created_at DESC")
-    contacts = [{'id': r[0], 'name': r[1], 'email': r[2], 'message': r[3], 'created_at': r[4]} for r in c.fetchall()]
-    conn.close()
+    with db.engine.connect() as conn:
+        rows = conn.execute(text("SELECT id, name, email, message, created_at FROM contacts ORDER BY created_at DESC")).fetchall()
+        contacts = [{'id': r[0], 'name': r[1], 'email': r[2], 'message': r[3], 'created_at': r[4]} for r in rows]
     return jsonify({'contacts': contacts})
 
 @app.route('/api/admin/feedbacks', methods=['GET'])
@@ -848,12 +845,9 @@ def get_feedbacks():
     user_email = get_jwt_identity()
     if user_email not in ADMIN_EMAILS:
         return jsonify({'error': 'Access denied. Admin only.'}), 403
-    
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, name, feedback, created_at FROM feedbacks ORDER BY created_at DESC")
-    feedbacks = [{'id': r[0], 'name': r[1], 'feedback': r[2], 'created_at': r[3]} for r in c.fetchall()]
-    conn.close()
+    with db.engine.connect() as conn:
+        rows = conn.execute(text("SELECT id, name, feedback, created_at FROM feedbacks ORDER BY created_at DESC")).fetchall()
+        feedbacks = [{'id': r[0], 'name': r[1], 'feedback': r[2], 'created_at': r[3]} for r in rows]
     return jsonify({'feedbacks': feedbacks})
 
 @app.route('/api/discussion/respond', methods=['POST'])
@@ -964,15 +958,8 @@ def submit_aptitude_answer():
         score = 10 if is_correct else 0
         
         user_id = get_jwt_identity()
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO user_progress 
-            (user_id, activity_type, activity_id, score) 
-            VALUES (?, 'aptitude', ?, ?)
-        """, (user_id, str(question_id), score))
-        conn.commit()
-        conn.close()
+        with db.engine.begin() as conn:
+            conn.execute(text("INSERT INTO user_progress (user_id, activity_type, activity_id, score) VALUES (:user_id, 'aptitude', :activity_id, :score)"), {"user_id": user_id, "activity_id": str(question_id), "score": score})
         
         response = {
             "correct": is_correct,
@@ -986,4 +973,7 @@ def submit_aptitude_answer():
         return jsonify({"error": "Failed to process answer"}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)  
+    app.run(
+        debug=(os.getenv('FLASK_DEBUG', 'False').lower() in ('1', 'true', 'yes')),
+        port=int(os.getenv('PORT', 5000))
+    )

@@ -1,0 +1,15 @@
+Flask
+flask-cors
+Flask-JWT-Extended
+python-dotenv
+spacy
+librosa
+numpy
+pydub
+scikit-learn
+soundfile
+openai
+gunicorn
+scipy
+SQLAlchemy
+psycopg2-binary
