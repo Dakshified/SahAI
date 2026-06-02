@@ -40,6 +40,70 @@ else:
     client = None
     print("Warning: GROQ_API_KEY is not set. Groq-powered AI feedback and TTS will be disabled or use fallback mode.")
 
+# Auto-detect a preferred model for LLM calls (prefer smaller/fast models when available)
+SELECTED_MODEL = None
+if client is not None:
+    try:
+        models_resp = client.models.list()
+        model_ids = []
+        if hasattr(models_resp, 'data'):
+            for m in models_resp.data:
+                mid = getattr(m, 'id', None) or (m.get('id') if isinstance(m, dict) else None)
+                if mid:
+                    model_ids.append(mid)
+        elif isinstance(models_resp, dict):
+            for m in models_resp.get('data', []):
+                if isinstance(m, dict):
+                    model_ids.append(m.get('id'))
+
+        preferred = [
+            "llama-3.1-8b-instant", "llama-3.1-8b", "llama-3.3-70b-versatile",
+            "llama3.1-70b-versatile", "gpt-4o-mini", "gpt-4o"
+        ]
+        for p in preferred:
+            if p in model_ids:
+                SELECTED_MODEL = p
+                break
+        if not SELECTED_MODEL and model_ids:
+            # pick a small-ish model if possible
+            for m in model_ids:
+                if 'instant' in m or '8b' in m or 'llama' in m:
+                    SELECTED_MODEL = m
+                    break
+        if not SELECTED_MODEL and model_ids:
+            SELECTED_MODEL = model_ids[0]
+
+        if SELECTED_MODEL:
+            os.environ['GROQ_PREFERRED_MODEL'] = SELECTED_MODEL
+            print(f"Selected Groq model for runtime: {SELECTED_MODEL}")
+        else:
+            print("No Groq models discovered for this key.")
+    except Exception as e:
+        print(f"Model autodiscovery failed: {e}")
+
+
+def safe_chat_completion(model, messages, max_tokens=150, temperature=0.7, timeout=20):
+    """Run a chat completion in a background thread and respect a timeout to avoid blocking workers."""
+    if client is None:
+        return None
+    try:
+        import concurrent.futures
+        def _call():
+            return client.chat.completions.create(model=model, messages=messages, max_tokens=max_tokens, temperature=temperature)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_call)
+            try:
+                return fut.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                print(f"LLM call timed out after {timeout}s for model {model}")
+                return None
+            except Exception as e:
+                print(f"LLM call error: {e}")
+                return None
+    except Exception as e:
+        print(f"safe_chat_completion wrapper error: {e}")
+        return None
+
 # Guarded imports with fallbacks
 try:
     from ai.nlp.nlp_analysis import (
@@ -117,13 +181,14 @@ def generate_discussion_reply(topic, user_input, conversation):
 
         Respond as an engaging discussion partner, 1-2 sentences, insightful and encouraging.
         """
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=150,
-            temperature=0.8
-        )
-        return response.choices[0].message.content.strip()
+        model_to_use = SELECTED_MODEL or os.getenv('GROQ_PREFERRED_MODEL') or "llama-3.1-8b-instant"
+        resp = safe_chat_completion(model_to_use, [{"role": "user", "content": prompt}], max_tokens=150, temperature=0.8, timeout=20)
+        if resp is None:
+            return "Hmm, I'm having trouble reaching the AI right now—let's try again in a moment."
+        try:
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            return str(resp)
     except Exception as e:
         print(f"Discussion reply error: {e}")
         return "Interesting point! What makes you think that? Let's explore this further."
@@ -259,12 +324,12 @@ def analyze():
             Indian context: Suggest cultural fits like confident eye contact in panels.
             """
 
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=400,
-                temperature=0.7
-            )
+            model_to_use = SELECTED_MODEL or os.getenv('GROQ_PREFERRED_MODEL') or "llama-3.1-8b-instant"
+            response = safe_chat_completion(model_to_use, [{"role": "user", "content": prompt}], max_tokens=400, temperature=0.7, timeout=30)
+
+            if response is None:
+                print("LLM returned no response (timeout or error); using heuristic fallback")
+                raise RuntimeError("LLM request timeout or failure")
 
             # Robust extraction of text from various possible response shapes
             raw_text = ""
@@ -711,10 +776,11 @@ def debug_llm():
             candidates = ["llama-3.3-70b-versatile", "llama3.1-70b-versatile", "gpt-4o-mini", "gpt-4o"]
             for c in candidates:
                 try:
-                    tmp = client.chat.completions.create(model=c, messages=[{"role": "user", "content": "hi"}], max_tokens=5)
-                    model_to_try = c
-                    print(f"Fallback model usable: {c}")
-                    break
+                    tmp = safe_chat_completion(c, [{"role": "user", "content": "hi"}], max_tokens=5, timeout=5)
+                    if tmp is not None:
+                        model_to_try = c
+                        print(f"Fallback model usable: {c}")
+                        break
                 except Exception as ex:
                     print(f"Model {c} not usable: {ex}")
 
@@ -722,12 +788,9 @@ def debug_llm():
             return jsonify({'ok': False, 'error': 'No accessible models found for this Groq key.', 'available_models_preview': available_models[:10]}), 200
 
         # Make a small chat request to the chosen model
-        resp = client.chat.completions.create(
-            model=model_to_try,
-            messages=[{"role": "user", "content": "Say hello in one short sentence."}],
-            max_tokens=40,
-            temperature=0.2
-        )
+        resp = safe_chat_completion(model_to_try, [{"role": "user", "content": "Say hello in one short sentence."}], max_tokens=40, temperature=0.2, timeout=8)
+        if resp is None:
+            return jsonify({'ok': False, 'error': 'LLM call timed out or failed', 'available_models_preview': available_models[:10]}), 200
 
         # Robustly extract text from response
         text = ''

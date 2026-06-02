@@ -36,6 +36,28 @@ except Exception as e:
     print(f"SpaCy model load failed: {e}")
     nlp = None
 
+
+    def _safe_llm_call(model, messages, max_tokens=150, temperature=0.7, timeout=15):
+        if client is None:
+            return None
+        try:
+            import concurrent.futures
+            def _call():
+                return client.chat.completions.create(model=model, messages=messages, max_tokens=max_tokens, temperature=temperature)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(_call)
+                try:
+                    return fut.result(timeout=timeout)
+                except concurrent.futures.TimeoutError:
+                    print(f"ai.nlp: LLM call timed out after {timeout}s for model {model}")
+                    return None
+                except Exception as e:
+                    print(f"ai.nlp: LLM call error: {e}")
+                    return None
+        except Exception as e:
+            print(f"ai.nlp: safe wrapper error: {e}")
+            return None
+
 def translate_hinglish_to_english(text):
     if not text.strip() or client is None:
         return text
@@ -55,12 +77,10 @@ def translate_hinglish_to_english(text):
         Text to translate: "{text}"
         """
         model_to_use = GROQ_MODEL
-        resp = client.chat.completions.create(
-            model=model_to_use,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
-            temperature=0.3
-        )
+        resp = _safe_llm_call(model_to_use, [{"role": "user", "content": prompt}], max_tokens=300, temperature=0.3, timeout=12)
+        if resp is None:
+            print("Hinglish translation LLM call timed out or failed")
+            return text
         translated = resp.choices[0].message.content.strip()
         # Strip outer quotes if present
         if translated.startswith('"') and translated.endswith('"'):
@@ -136,7 +156,9 @@ def advanced_grammar_analysis(text):
     if client is not None:
         try:
             quality_prompt = f"Analyze vagueness/sentence flow in: '{text[:500]}...' (100 words max). Flag issues; suggest 1 fix. JSON: {{'quality_score': 0-1, 'notes': 'brief note'}}"
-            resp = client.chat.completions.create(model=GROQ_MODEL, messages=[{"role": "user", "content": quality_prompt}], max_tokens=100)
+            resp = _safe_llm_call(GROQ_MODEL, [{"role": "user", "content": quality_prompt}], max_tokens=100, timeout=10)
+            if resp is None:
+                raise RuntimeError("LLM quality check timed out or failed")
             quality_json = json.loads(resp.choices[0].message.content)
             quality_score = quality_json.get('quality_score', 0.7)
             if quality_score < 0.6: issues.append(quality_json.get('notes', 'Tighten vagueness for sharper impact.'))
@@ -160,7 +182,9 @@ def generate_expected_keywords(question, question_type):
     if client is not None:
         try:
             kw_prompt = f"List 5-8 key words/phrases for strong answer to '{question}' ({question_type}). JSON array only."
-            resp = client.chat.completions.create(model=GROQ_MODEL, messages=[{"role": "user", "content": kw_prompt}], max_tokens=100)
+            resp = _safe_llm_call(GROQ_MODEL, [{"role": "user", "content": kw_prompt}], max_tokens=100, timeout=10)
+            if resp is None:
+                raise RuntimeError("LLM keyword generation timed out or failed")
             return json.loads(resp.choices[0].message.content)
         except Exception as e:
             print(f"Groq keyword generation skipped: {e}")
