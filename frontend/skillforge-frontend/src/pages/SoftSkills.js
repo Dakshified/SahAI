@@ -1,7 +1,7 @@
 // src/pages/SoftSkills.js
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import axios from 'axios';
+import api from '../utils/axios';
 
 const SoftSkills = () => {
   const [activeTab, setActiveTab] = useState(0);
@@ -79,7 +79,7 @@ const SoftSkills = () => {
     stopSpeaking();
 
     try {
-      const response = await axios.post('http://127.0.0.1:5000/api/discussion/respond', {
+      const response = await api.post('/api/discussion/respond', {
         topic: selectedTopic,
         userInput: transcript.trim(),
         conversation: [...conversation, userMessage],
@@ -237,12 +237,10 @@ const SoftSkills = () => {
       const token = getAuthToken();
       if (token) {
         try {
-          await axios.post('http://127.0.0.1:5000/api/progress/complete', {
+          await api.post('/api/progress/complete', {
             activityType: 'soft_skill',
             activityId: `${type}_quiz`,
             score: Math.round((finalScore / qList.length) * 100)
-          }, {
-            headers: getAuthHeaders()
           });
           console.log('Soft skill progress saved');
         } catch (err) {

@@ -1,4 +1,4 @@
-from sentence_transformers import SentenceTransformer, util
+import requests
 import spacy
 import re
 import random
@@ -13,7 +13,6 @@ else:
     client = None
     print("Warning: GROQ_API_KEY is not set. Groq-powered NLP enhancements will be disabled.")
 
-model = SentenceTransformer('all-MiniLM-L6-v2')
 nlp = spacy.load("en_core_web_sm")
 
 def translate_hinglish_to_english(text):
@@ -53,14 +52,44 @@ def translate_hinglish_to_english(text):
 
 def compute_similarity(text_a, text_b):
     if not text_a.strip() or not text_b.strip(): return 0.0
+    
+    # Try calling Hugging Face free Inference API (no memory footprint)
     try:
-        a = model.encode(text_a, convert_to_tensor=True)
-        b = model.encode(text_b, convert_to_tensor=True)
-        cos = util.pytorch_cos_sim(a, b).item()
-        uncertainty_penalty = 0.3 if any(phrase in text_b.lower() for phrase in ["don't know", "sorry", "unsure", "idk", "um"]) else 1.0
-        return max(0.0, min(1.0, float(cos) * uncertainty_penalty))
+        API_URL = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+        headers = {}
+        hf_token = os.getenv("HF_API_TOKEN", "")
+        if hf_token:
+            headers["Authorization"] = f"Bearer {hf_token}"
+            
+        payload = {
+            "inputs": {
+                "source_sentence": text_a,
+                "sentences": [text_b]
+            }
+        }
+        
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=5)
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                cos = float(result[0])
+                uncertainty_penalty = 0.3 if any(phrase in text_b.lower() for phrase in ["don't know", "sorry", "unsure", "idk", "um"]) else 1.0
+                return max(0.0, min(1.0, cos * uncertainty_penalty))
     except Exception as e:
-        print(f"Similarity error: {e}")
+        print(f"Hugging Face similarity API error: {e}. Falling back to Jaccard similarity.")
+
+    # Fallback to Jaccard overlap similarity (lightweight TF-IDF style)
+    try:
+        words_a = set(re.findall(r'\b\w+\b', text_a.lower()))
+        words_b = set(re.findall(r'\b\w+\b', text_b.lower()))
+        if not words_a or not words_b: return 0.0
+        intersection = words_a.intersection(words_b)
+        jaccard = len(intersection) / len(words_a.union(words_b))
+        uncertainty_penalty = 0.3 if any(phrase in text_b.lower() for phrase in ["don't know", "sorry", "unsure", "idk", "um"]) else 1.0
+        scaled_score = min(1.0, jaccard * 2.0)
+        return max(0.0, min(1.0, scaled_score * uncertainty_penalty))
+    except Exception as e:
+        print(f"Jaccard similarity fallback error: {e}")
         return 0.2 if "don't know" in text_b.lower() else 0.5
 
 def generate_suggestions(transcript):

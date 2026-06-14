@@ -23,6 +23,11 @@ import warnings  # To suppress deprecation warnings
 from dotenv import load_dotenv
 load_dotenv()  # Loads .env
 
+# Prepend project bin directory to PATH for ffmpeg binary locating
+bin_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
+if os.path.exists(bin_dir):
+    os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
+
 # Suppress librosa FutureWarning
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -986,4 +991,5 @@ def submit_aptitude_answer():
         return jsonify({"error": "Failed to process answer"}), 500
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)  
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=True, host="0.0.0.0", port=port)

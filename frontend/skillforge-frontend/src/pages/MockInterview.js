@@ -7,6 +7,8 @@
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:5000';
+
 const css = `
 /* Embedded mock CSS (keeps theme/colors you asked) */
 .mock-interview-wrap {
@@ -389,7 +391,7 @@ export default function MockInterview() {
 
     const pointsToAdd = Math.floor(overallScore / 10); // e.g., 85% score -> 8 points; adjust formula as needed
     try {
-      const response = await fetch('http://localhost:5000/api/gamification/add-points', {
+      const response = await fetch(`${API_BASE_URL}/api/gamification/add-points`, {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -562,7 +564,7 @@ export default function MockInterview() {
         fd.append('confidence', (confidence || 0).toString());
         fd.append('bilingual', bilingual ? 'true' : 'false');
 
-        const res = await fetch('http://localhost:5000/api/analyze', { method:'POST', body: fd });
+        const res = await fetch(`${API_BASE_URL}/api/analyze`, { method:'POST', body: fd });
         if (!res.ok) throw new Error('analysis failed');
         const json = await res.json();
         // normalize server result to frontend shape (enhanced for mock feedback)
