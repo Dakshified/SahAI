@@ -1,5 +1,5 @@
 import sqlite3
-DB_PATH = '../skillforge.db'
+DB_PATH = 'skillforge.db'
 conn = sqlite3.connect(DB_PATH)
 c = conn.cursor()
 c.execute("INSERT INTO user_progress VALUES (NULL, 'test@example.com', 'aptitude', 'apt1', CURRENT_TIMESTAMP, 100, '{}')")

@@ -1,6 +1,6 @@
 import sqlite3
 
-conn = sqlite3.connect('../skillforge.db')
+conn = sqlite3.connect('skillforge.db')
 c = conn.cursor()
 
 # Drop old tables if exist (for clean start)

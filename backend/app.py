@@ -85,7 +85,7 @@ CORS(app)
 app.config['JWT_SECRET_KEY'] = 'skillforge-secret-2025'
 jwt = JWTManager(app)
 
-DB_PATH = '../skillforge.db'
+DB_PATH = 'skillforge.db'
 
 # SpaCy
 try:
